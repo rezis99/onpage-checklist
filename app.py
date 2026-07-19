@@ -172,6 +172,29 @@ def get_indexable_urls(all_pages_df: pd.DataFrame) -> list:
     return df.loc[mask, "Address"].dropna().unique().tolist()
 
 
+HUB_PAGE_PATTERNS = (
+    "/cancernews/all-articles", "/cancernews/research", "/cancernews/cancer-education",
+    "/cancernews/authors", "/cancernews/contributors",
+)
+
+
+def is_hub_or_nav_page(url: str) -> bool:
+    """Hub/listing pages contain article teasers (duplicated titles/intros),
+    which caused false 1.0-similarity matches. They're linked from nav anyway,
+    so they're never useful in-content link suggestions."""
+    u = url.rstrip("/")
+    if u in ("https://binaytara.org", "http://binaytara.org"):
+        return True
+    if u.endswith("/cancernews"):
+        return True
+    return any(p in u for p in HUB_PAGE_PATTERNS)
+
+
+def is_content_article_url(url: str) -> bool:
+    """Only real article pages produce meaningful paragraph matches."""
+    return "/cancernews/article/" in url or "/ijccd" in url
+
+
 def gsc_queries_for_page(gsc_df: pd.DataFrame, page_url: str, top_n: int = 15) -> list:
     """Top queries (by clicks) that a given page ranks for — the 'topic DNA'."""
     if gsc_df.empty or "Page" not in gsc_df.columns:
@@ -354,6 +377,22 @@ def extract_page_details(html: str, page_url: str) -> dict:
     canonical_tag = soup.find("link", rel="canonical")
     paragraphs_text = _extract_block_text(scope)
 
+    # Publication date: JSON-LD datePublished is the most reliable source,
+    # falling back to a <time> tag, then a visible "Month DD, YYYY" string.
+    pub_date = None
+    m_date = re.search(r'"datePublished"\s*:\s*"([^"]+)"', html)
+    if m_date:
+        pub_date = m_date.group(1)
+    elif soup.find("time"):
+        t = soup.find("time")
+        pub_date = t.get("datetime") or clean_whitespace(t.get_text())
+    else:
+        m_vis = re.search(
+            r"\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}\b",
+            paragraphs_text)
+        if m_vis:
+            pub_date = m_vis.group(0)
+
     return {
         "headings": headings,
         "links": links,
@@ -365,6 +404,7 @@ def extract_page_details(html: str, page_url: str) -> dict:
         "robots": meta_content(name="robots"),
         "viewport": meta_content(name="viewport"),
         "full_text": paragraphs_text,
+        "pub_date": pub_date,
         "h1": (lambda hs: hs[0][1] if hs else "")([h for h in headings if h[0] == 1]),
     }
 
@@ -577,7 +617,7 @@ def build_paragraph_index(site_content: list) -> dict:
     for page in site_content:
         if not page.get("ok") or not page.get("text"):
             continue
-        paras = split_into_paragraphs(page["text"])
+        paras = [p for p in split_into_paragraphs(page["text"]) if len(p) >= 120]
         for i, p in enumerate(paras):
             meta.append({
                 "url": page["url"],
@@ -594,7 +634,8 @@ def build_paragraph_index(site_content: list) -> dict:
 
 def match_paragraph_against_index(paragraph_embedding: np.ndarray, index: dict,
                                     exclude_url: str = None, top_k: int = 5,
-                                    min_similarity: float = 0.45) -> list:
+                                    min_similarity: float = 0.55,
+                                    max_similarity: float = 0.93) -> list:
     """Find the top-k most similar indexed paragraphs to a single query
     paragraph embedding, optionally excluding a source URL (so an article
     doesn't get matched against itself when it's already published).
@@ -617,6 +658,10 @@ def match_paragraph_against_index(paragraph_embedding: np.ndarray, index: dict,
         score = float(sims[idx])
         if score < min_similarity:
             break  # sims sorted descending, so we can stop early
+        if score >= max_similarity:
+            # Near-identical text = the same teaser/snippet on another page,
+            # not a genuine linking opportunity. Skip.
+            continue
         results.append({**m, "similarity": score})
     return results
 
@@ -642,12 +687,29 @@ Pipeline per spec:
 
 STOPWORDS_FOR_ANCHOR = {"the", "a", "an", "of", "and", "to", "for", "in", "on", "with"}
 
+CITATION_PATTERN = re.compile(
+    r"\bet al\b|\bPresented at\b|(New England Journal|Blood|Lancet|Nat Med|JAMA|J Clin Oncol)\s*,?\s*(19|20)\d{2}",
+    re.IGNORECASE,
+)
+
+
+def _is_citation_paragraph(text: str) -> bool:
+    """References-section entries aren't places to put internal links."""
+    return bool(CITATION_PATTERN.search(text))
+
 
 def _derive_anchor_from_h1_or_title(h1: str, title: str) -> str:
-    """Fallback anchor text when a page isn't in the anchor guide."""
+    """Fallback anchor text when a page isn't in the anchor guide.
+    Strips site suffixes, cuts at the first colon (subtitle), and trims to
+    ~60 chars at a word boundary so anchors read naturally."""
     base = h1 or title or ""
     base = re.sub(r"\s*\|.*$", "", base)  # strip " | The Cancer News" suffixes
-    return base.strip()[:80]
+    if ":" in base and len(base) > 60:
+        base = base.split(":")[0]
+    base = base.strip()
+    if len(base) > 60:
+        base = base[:60].rsplit(" ", 1)[0]
+    return base.strip()
 
 
 def _tfidf_keyword_overlap(paragraph: str, candidate_text: str) -> float:
@@ -697,6 +759,8 @@ def build_forward_suggestions(article_paragraphs: list, para_index: dict,
     suggestions = []
 
     for i, (para_text, para_emb) in enumerate(zip(article_paragraphs, embeddings)):
+        if len(para_text) < 80 or _is_citation_paragraph(para_text):
+            continue  # headings, fragments, and reference entries aren't link spots
         matches = match_paragraph_against_index(para_emb, para_index, exclude_url=exclude_url, top_k=top_k)
         for m in matches:
             target_url = m["url"]
@@ -737,10 +801,12 @@ def build_forward_suggestions(article_paragraphs: list, para_index: dict,
                 "gsc_matching_queries": gsc_check.get("matching_queries", []),
                 "anchor_guide_notes": notes,
             })
-    # Deduplicate: one suggestion per (source_paragraph, target_url) — keep highest similarity
+    # Deduplicate by TARGET URL — the SOP itself forbids duplicate link
+    # targets in one article, so we recommend each target exactly once,
+    # at its best-matching paragraph.
     seen = {}
     for s in suggestions:
-        key = (s["source_paragraph_index"], s["target_url"])
+        key = s["target_url"]
         if key not in seen or s["similarity"] > seen[key]["similarity"]:
             seen[key] = s
     suggestions = list(seen.values())
@@ -763,8 +829,12 @@ def build_bidirectional_suggestions(article_paragraphs: list, article_h1: str,
     reverse_hits = []
 
     for i, (para_text, para_emb) in enumerate(zip(article_paragraphs, embeddings)):
+        if len(para_text) < 80 or _is_citation_paragraph(para_text):
+            continue
         matches = match_paragraph_against_index(para_emb, para_index, exclude_url=article_url, top_k=top_k)
         for m in matches:
+            if _is_citation_paragraph(m["text"]):
+                continue  # don't suggest inserting links into a References list
             reverse_hits.append({
                 "article_paragraph_index": i,
                 "article_paragraph_excerpt": para_text[:160],
@@ -779,16 +849,19 @@ def build_bidirectional_suggestions(article_paragraphs: list, article_h1: str,
     if anchor_entry:
         this_article_anchor = anchor_entry.get("Primary Anchor Text") or article_h1
     else:
-        this_article_anchor = article_h1 or "this article"
+        # Derive a natural-length anchor from the H1 (full 90+ char titles
+        # make unusable anchor text)
+        this_article_anchor = _derive_anchor_from_h1_or_title(article_h1, "") or "this article"
 
     for hit in reverse_hits:
         hit["direction"] = "inbound"
         hit["recommended_anchor_text"] = this_article_anchor
 
-    # Deduplicate: one per (source_page_url, article_paragraph_index)
+    # Deduplicate by SOURCE PAGE — one actionable "add a link on page X"
+    # recommendation per page, at its best-matching paragraph.
     seen = {}
     for h in reverse_hits:
-        key = (h["source_page_url"], h["article_paragraph_index"])
+        key = h["source_page_url"]
         if key not in seen or h["similarity"] > seen[key]["similarity"]:
             seen[key] = h
     reverse_hits = list(seen.values())
@@ -798,7 +871,8 @@ def build_bidirectional_suggestions(article_paragraphs: list, article_h1: str,
 
 def run_link_engine(article_text: str, article_h1: str, para_index: dict,
                      anchor_df, gsc_df, article_url: str = None,
-                     top_k_forward: int = 3, top_k_bidirectional: int = 5) -> dict:
+                     top_k_forward: int = 3, top_k_bidirectional: int = 5,
+                     max_outbound: int = 10, max_inbound: int = 10) -> dict:
     """Top-level entry point used by app.py. Returns forward + bidirectional
     suggestions plus the cannibalization map, ready to render.
     """
@@ -815,8 +889,8 @@ def run_link_engine(article_text: str, article_h1: str, para_index: dict,
     )
     return {
         "paragraph_count": len(paragraphs),
-        "forward_suggestions": forward,
-        "bidirectional_suggestions": bidirectional,
+        "forward_suggestions": forward[:max_outbound],
+        "bidirectional_suggestions": bidirectional[:max_inbound],
         "cannibalization_map": cannibal_map,
     }
 
@@ -1280,7 +1354,16 @@ st.caption(
 @st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
 def _cached_indexable_urls():
     all_pages = load_all_pages()
-    return tuple(get_indexable_urls(all_pages))
+    indexable = get_indexable_urls(all_pages)
+    anchor_df_local = load_anchor_guide()
+    guide_urls = set(anchor_df_local["Page URL"].tolist())
+    keep = []
+    for u in indexable:
+        if is_hub_or_nav_page(u):
+            continue
+        if is_content_article_url(u) or u in guide_urls:
+            keep.append(u)
+    return tuple(keep)
 
 
 def get_or_build_index():
