@@ -1079,20 +1079,29 @@ def check_images(images: list) -> dict:
     """images: list of dicts {src, alt}"""
     if not images:
         return _result("Images", "warn", "No images detected.")
-    issues = []
+    issues, fixes = [], []
     for img in images:
         alt = (img.get("alt") or "").strip()
+        src_short = img.get("src", "")[:60]
         if not alt:
-            issues.append(f"missing alt text: {img.get('src', '')[:60]}")
+            issues.append(f"missing alt text: {src_short}")
+            fixes.append({"image": src_short, "current": "(empty)",
+                           "fix": "Write a 5-15 word description of what the image shows, ending with a period."})
             continue
+        problems = []
         if len(alt) > 125:
-            issues.append(f"alt text over 125 chars: {img.get('src', '')[:60]}")
-        if alt.lower().startswith("image of"):
-            issues.append(f"alt text starts with 'Image of': {img.get('src', '')[:60]}")
+            problems.append("over 125 chars")
+        if re.match(r"^(image of|picture of|photo of)", alt, re.IGNORECASE):
+            problems.append("starts with 'Image of'")
         if not alt.rstrip().endswith("."):
-            issues.append(f"alt text missing trailing period: {img.get('src', '')[:60]}")
+            problems.append("missing trailing period")
+        if problems:
+            issues.append(f"{', '.join(problems)}: {src_short}")
+            fixes.append({"image": src_short, "current": alt,
+                           "fix": suggest_alt_text_fix(alt)})
     if issues:
-        return _result("Images", "warn", "; ".join(issues), {"image_count": len(images)})
+        return _result("Images", "warn", "; ".join(issues),
+                        {"image_count": len(images), "copy_paste_fixes": fixes})
     return _result("Images", "pass", f"{len(images)} image(s), alt text clean.")
 
 
@@ -1306,6 +1315,250 @@ def run_all_sop_checks(payload: dict, is_draft: bool = False) -> list:
 
 
 # =============================================================================
+# SECTION 6.5: ACTIONABLE RECOMMENDATIONS (GSC/Semrush-driven, writer-facing)
+# =============================================================================
+
+def analyze_target_queries(page_url: str, gsc_df, semrush_df,
+                             title: str, h1: str, meta_desc: str,
+                             first_para: str) -> dict:
+    """The core on-page question: does this page's title/H1/meta/opening
+    contain the query it actually ranks (or should rank) for?
+
+    Uses GSC as ground truth for what Google associates with the page, plus
+    Semrush for volume context. Returns placement gaps and CTR opportunities.
+    """
+    out = {"has_data": False}
+    if gsc_df.empty or "Page" not in gsc_df.columns:
+        return out
+    sub = gsc_df[gsc_df["Page"] == page_url].copy()
+    if sub.empty:
+        return out
+    for col in ("Clicks", "Impressions"):
+        if col in sub.columns:
+            sub[col] = pd.to_numeric(sub[col].astype(str).str.replace(",", "").str.replace("%", ""), errors="coerce").fillna(0)
+    if "Avg Position" in sub.columns:
+        sub["Avg Position"] = pd.to_numeric(sub["Avg Position"], errors="coerce")
+
+    by_clicks = sub.sort_values("Clicks", ascending=False)
+    by_impr = sub.sort_values("Impressions", ascending=False)
+    primary = str(by_clicks.iloc[0]["Query"]) if by_clicks.iloc[0]["Clicks"] > 0 else str(by_impr.iloc[0]["Query"])
+
+    def _contains(text, query):
+        if not text:
+            return False
+        t = text.lower()
+        words = [w for w in query.lower().split() if len(w) > 2]
+        if not words:
+            return False
+        hits = sum(1 for w in words if w in t)
+        return hits >= max(1, int(len(words) * 0.6))
+
+    placement = {
+        "meta_title": _contains(title, primary),
+        "h1": _contains(h1, primary),
+        "meta_description": _contains(meta_desc, primary),
+        "first_paragraph": _contains(first_para, primary),
+    }
+
+    # Striking distance: page 1 bottom / page 2 with real impressions —
+    # these are the highest-ROI targets for on-page tightening.
+    striking = []
+    if "Avg Position" in sub.columns:
+        sd = sub[(sub["Avg Position"] > 4) & (sub["Avg Position"] <= 20) & (sub["Impressions"] >= 50)]
+        sd = sd.sort_values("Impressions", ascending=False).head(5)
+        for _, r in sd.iterrows():
+            striking.append({"query": r["Query"], "position": round(float(r["Avg Position"]), 1),
+                              "impressions": int(r["Impressions"]), "clicks": int(r["Clicks"])})
+
+    # CTR opportunities: ranking well but nobody clicks = title/meta problem.
+    ctr_opps = []
+    if "Avg Position" in sub.columns:
+        co = sub[(sub["Avg Position"] <= 10) & (sub["Impressions"] >= 100)]
+        for _, r in co.iterrows():
+            ctr = (r["Clicks"] / r["Impressions"] * 100) if r["Impressions"] else 0
+            if ctr < 2.0:
+                ctr_opps.append({"query": r["Query"], "position": round(float(r["Avg Position"]), 1),
+                                  "impressions": int(r["Impressions"]), "ctr_pct": round(ctr, 2)})
+    ctr_opps = sorted(ctr_opps, key=lambda x: x["impressions"], reverse=True)[:5]
+
+    # Semrush volume for the primary query (context for the writer)
+    volume = None
+    if semrush_df is not None and not semrush_df.empty and "Keyword" in semrush_df.columns:
+        m = semrush_df[semrush_df["Keyword"].astype(str).str.lower() == primary.lower()]
+        if not m.empty and "Search Volume" in m.columns:
+            try:
+                volume = int(str(m.iloc[0]["Search Volume"]).replace(",", ""))
+            except (ValueError, TypeError):
+                volume = None
+
+    return {
+        "has_data": True,
+        "primary_query": primary,
+        "primary_volume": volume,
+        "top_queries_by_clicks": by_clicks["Query"].head(5).tolist(),
+        "placement": placement,
+        "striking_distance": striking,
+        "ctr_opportunities": ctr_opps,
+    }
+
+
+def suggest_meta_titles(current_title: str, h1: str, primary_query: str) -> list:
+    """Copy-paste-ready title candidates: primary query front-loaded,
+    50-60 chars, brand suffix when it fits. Starting points, not gospel."""
+    suffix = " | Cancer News"
+    core = _derive_anchor_from_h1_or_title(h1, current_title)
+    candidates = []
+
+    TRAILING_JUNK = {"of", "and", "to", "for", "in", "on", "with", "the", "a",
+                      "an", "you", "your", "shouldn't", "should", "who", "when", "what"}
+
+    def _fit(text):
+        text = text.strip()
+        if len(text) > 60:
+            text = text[:60].rsplit(" ", 1)[0]
+        words = text.rstrip(" :,-").split()
+        while words and words[-1].lower().strip(",:;") in TRAILING_JUNK:
+            words.pop()
+        text = " ".join(words).rstrip(" :,-")
+        if len(text) + len(suffix) <= 60:
+            return text + suffix
+        return text
+
+    if primary_query and primary_query.lower() not in core.lower():
+        # Capitalize word-initial letters without breaking hyphenated terms
+        # like "car-t" -> "CAR-T" is impossible to infer, so only uppercase
+        # the first character of each space-separated word.
+        q = " ".join(w[0].upper() + w[1:] if w else w for w in primary_query.strip().split()) \
+            if primary_query.islower() else primary_query.strip()
+        candidates.append(_fit(f"{q}: {core}"[:60].rsplit(' ', 1)[0] if len(f"{q}: {core}") > 60 else f"{q}: {core}"))
+        candidates.append(_fit(q))
+    candidates.append(_fit(core))
+
+    seen, out = set(), []
+    for c in candidates:
+        c = c.strip(" :,-")
+        if c and c.lower() not in seen and 20 <= len(c) <= 70:
+            seen.add(c.lower())
+            out.append({"title": c, "length": len(c)})
+    return out[:3]
+
+
+def suggest_alt_text_fix(alt: str) -> str:
+    """Return the corrected alt string the editor can paste directly."""
+    fixed = (alt or "").strip()
+    fixed = re.sub(r"^(image of|picture of|photo of)\s+", "", fixed, flags=re.IGNORECASE)
+    if len(fixed) > 125:
+        fixed = fixed[:122].rsplit(" ", 1)[0]
+    fixed = fixed.rstrip(".") + "."
+    return fixed
+
+
+def check_first_paragraph(first_para: str, primary_query: str, h1: str) -> dict:
+    """The opening paragraph is the page's most-read SEO asset: it should
+    state the topic (primary query terms), define the subject, and stay tight."""
+    if not first_para:
+        return _result("First paragraph", "warn", "No first paragraph detected.")
+    issues, fixes = [], []
+    words = len(first_para.split())
+    if words > 120:
+        issues.append(f"{words} words — too long for an opening (aim 40-90)")
+        fixes.append("Split it: lead with the direct answer, move detail to paragraph 2.")
+
+    key_terms = [w for w in (primary_query or h1 or "").lower().split() if len(w) > 3][:4]
+    if key_terms:
+        present = [w for w in key_terms if w in first_para.lower()]
+        if len(present) < max(1, len(key_terms) // 2):
+            issues.append(f"missing key topic terms ({', '.join(key_terms)})")
+            fixes.append(f"Work the primary topic naturally into the first 1-2 sentences.")
+
+    if not re.search(r"\b(is|are|refers to|means)\b", first_para[:250], re.IGNORECASE):
+        issues.append("no early definition/direct-answer pattern")
+        fixes.append("Open with a direct statement: '<Topic> is ...' — it wins featured snippets and satisfies Koray's framework.")
+
+    if issues:
+        return _result("First paragraph", "warn", "; ".join(issues),
+                        {"fixes": fixes, "first_paragraph": first_para[:300]})
+    return _result("First paragraph", "pass", f"{words} words, topic terms present, direct-answer pattern found.")
+
+
+def check_duplicate_title_meta(page_url: str, title: str, meta_desc: str, all_pages_df) -> dict:
+    """Duplicate titles/descriptions across the site dilute relevance and
+    confuse Google's choice of which page to rank. Screaming Frog data
+    (All Page tab) makes this check free."""
+    if all_pages_df is None or all_pages_df.empty or "Title 1" not in all_pages_df.columns:
+        return _result("Duplicate title/meta (site-wide)", "warn", "Crawl data unavailable for duplicate check.")
+    issues = []
+    df = all_pages_df
+    if title:
+        dup_t = df[(df["Title 1"].astype(str).str.strip().str.lower() == title.strip().lower())
+                    & (df["Address"] != page_url)]
+        if not dup_t.empty:
+            issues.append(f"title duplicated on {len(dup_t)} other page(s): "
+                           + ", ".join(dup_t["Address"].head(3).tolist()))
+    if meta_desc and "Meta Description 1" in df.columns:
+        dup_d = df[(df["Meta Description 1"].astype(str).str.strip().str.lower() == meta_desc.strip().lower())
+                    & (df["Address"] != page_url)]
+        if not dup_d.empty:
+            issues.append(f"meta description duplicated on {len(dup_d)} other page(s): "
+                           + ", ".join(dup_d["Address"].head(3).tolist()))
+    if issues:
+        return _result("Duplicate title/meta (site-wide)", "fail", "; ".join(issues))
+    return _result("Duplicate title/meta (site-wide)", "pass", "Title and meta description are unique across the crawl.")
+
+
+def semrush_volume_for_url(semrush_df, url: str) -> list:
+    """Top Semrush keywords for a URL — volume context next to link suggestions."""
+    if semrush_df is None or semrush_df.empty or "URL" not in semrush_df.columns:
+        return []
+    sub = semrush_df[semrush_df["URL"].astype(str).str.strip() == url]
+    if sub.empty:
+        return []
+    rows = []
+    for _, r in sub.head(3).iterrows():
+        try:
+            vol = int(str(r.get("Search Volume", "")).replace(",", ""))
+        except (ValueError, TypeError):
+            vol = None
+        rows.append({"keyword": str(r.get("Keyword", "")), "volume": vol,
+                      "position": r.get("Position")})
+    return rows
+
+
+def build_action_list(checks: list, query_analysis: dict, title_suggestions: list) -> list:
+    """Turn the audit into a prioritized writer's to-do list. Order:
+    ranking-impact fixes first, then compliance items."""
+    actions = []
+    qa = query_analysis or {}
+    if qa.get("has_data"):
+        p = qa["placement"]
+        pq = qa["primary_query"]
+        if not p["meta_title"]:
+            sugg = f" Suggested: \"{title_suggestions[0]['title']}\" ({title_suggestions[0]['length']} chars)" if title_suggestions else ""
+            actions.append(("HIGH", f"Meta title doesn't contain your top query '{pq}'.{sugg}"))
+        if not p["h1"]:
+            actions.append(("HIGH", f"H1 doesn't contain your top query '{pq}' — work it in naturally."))
+        if not p["first_paragraph"]:
+            actions.append(("HIGH", f"First paragraph doesn't mention '{pq}' — Google and readers should see the topic immediately."))
+        if not p["meta_description"]:
+            actions.append(("MED", f"Meta description doesn't contain '{pq}' — it's your SERP ad copy; include the query searchers typed."))
+        for opp in qa.get("ctr_opportunities", [])[:2]:
+            actions.append(("HIGH", f"CTR opportunity: ranking #{opp['position']} for '{opp['query']}' with {opp['impressions']} impressions but {opp['ctr_pct']}% CTR — rewrite title/meta to match this intent."))
+        for s in qa.get("striking_distance", [])[:2]:
+            actions.append(("MED", f"Striking distance: #{s['position']} for '{s['query']}' ({s['impressions']} impressions) — strengthen coverage of this subtopic to reach page 1."))
+    for c in checks:
+        if c["status"] == "fail":
+            msg = f"{c['check']}: {c['message']}"
+            if c["check"] == "Meta title" and title_suggestions:
+                msg += f" Suggested rewrite: \"{title_suggestions[0]['title']}\" ({title_suggestions[0]['length']} chars)"
+            actions.append(("HIGH", msg))
+    for c in checks:
+        if c["status"] == "warn" and c["check"] in ("Meta title", "Headings", "First paragraph", "Images", "Internal links"):
+            actions.append(("MED", f"{c['check']}: {c['message']}"))
+    return actions
+
+
+
+# =============================================================================
 # SECTION 7: STREAMLIT UI
 # =============================================================================
 
@@ -1426,6 +1679,51 @@ def render_checks(checks: list):
                 st.json(c["details"])
 
 
+def render_action_list(actions: list):
+    if not actions:
+        return
+    st.subheader("📋 Writer's action list — fix these first")
+    high = [a for p, a in actions if p == "HIGH"]
+    med = [a for p, a in actions if p == "MED"]
+    for a in high:
+        st.error(f"🔴 {a}")
+    for a in med:
+        st.warning(f"🟡 {a}")
+
+
+def render_query_analysis(qa: dict, title_suggestions: list):
+    st.subheader("🎯 Target query analysis (from GSC)")
+    if not qa.get("has_data"):
+        st.info("No GSC data found for this URL — the page may be new, or the "
+                "GSC Data tab needs a fresh export covering it.")
+        return
+    vol = f" · Semrush volume: {qa['primary_volume']:,}/mo" if qa.get("primary_volume") else ""
+    st.markdown(f"**Primary query (by clicks):** `{qa['primary_query']}`{vol}")
+
+    p = qa["placement"]
+    cols = st.columns(4)
+    labels = [("meta_title", "Meta title"), ("h1", "H1"),
+              ("meta_description", "Meta desc"), ("first_paragraph", "First para")]
+    for col, (key, label) in zip(cols, labels):
+        col.metric(label, "✅ contains" if p[key] else "❌ missing")
+
+    show_rewrites = title_suggestions and (not p["meta_title"])
+    if show_rewrites:
+        st.markdown("**Suggested title rewrites (starting points — edit for accuracy):**")
+        for t in title_suggestions:
+            st.code(f"{t['title']}  ({t['length']} chars)")
+
+    if qa.get("ctr_opportunities"):
+        st.markdown("**CTR opportunities — ranking well, few clicks (title/meta mismatch):**")
+        for o in qa["ctr_opportunities"]:
+            st.write(f"- `{o['query']}` — position {o['position']}, {o['impressions']:,} impressions, {o['ctr_pct']}% CTR")
+
+    if qa.get("striking_distance"):
+        st.markdown("**Striking-distance queries — strengthen these subtopics to reach page 1:**")
+        for s in qa["striking_distance"]:
+            st.write(f"- `{s['query']}` — position {s['position']}, {s['impressions']:,} impressions")
+
+
 def render_link_suggestions(result: dict):
     st.subheader("🔗 Internal link suggestions")
     st.caption(f"{result['paragraph_count']} paragraph(s) analyzed against the site index.")
@@ -1440,6 +1738,11 @@ def render_link_suggestions(result: dict):
         with st.expander(f"[{s['similarity']}] → {s['target_title'] or s['target_url']}  ({badge})"):
             st.write(f"**Recommended anchor text:** {s['recommended_anchor_text']}")
             st.write(f"**Target URL:** {s['target_url']}")
+            sem = semrush_volume_for_url(semrush_df, s['target_url'])
+            if sem:
+                kw_str = ", ".join(f"'{k['keyword']}' ({k['volume']:,}/mo)" for k in sem if k.get("volume"))
+                if kw_str:
+                    st.caption(f"📊 Target ranks for: {kw_str}")
             st.write(f"**Place near article paragraph #{s['source_paragraph_index'] + 1}:** "
                      f"\"{s['source_paragraph_excerpt']}...\"")
             st.write(f"**Matched target paragraph:** \"{s['target_paragraph_excerpt']}...\"")
@@ -1502,6 +1805,9 @@ if mode == "Before Publishing (draft)":
             "h1": parsed["h1"] or "",
         }
         checks = run_all_sop_checks(payload, is_draft=True)
+        first_para = parsed["paragraphs"][0] if parsed["paragraphs"] else ""
+        checks.append(check_first_paragraph(first_para, "", parsed["h1"] or ""))
+        render_action_list(build_action_list(checks, {}, []))
         render_checks(checks)
 
         if "para_index" not in st.session_state:
@@ -1543,6 +1849,20 @@ else:
                 "slug": url.rstrip("/").split("/")[-1],
             }
             checks = run_all_sop_checks(payload)
+
+            # GSC-driven target query analysis + writer-facing extras
+            first_para = paragraphs[0] if paragraphs else ""
+            qa = analyze_target_queries(url, gsc_df, semrush_df,
+                                          details.get("meta_title", ""), details.get("h1", ""),
+                                          details.get("meta_description", ""), first_para)
+            title_suggs = suggest_meta_titles(details.get("meta_title", ""), details.get("h1", ""),
+                                                qa.get("primary_query", ""))
+            checks.append(check_first_paragraph(first_para, qa.get("primary_query", ""), details.get("h1", "")))
+            checks.append(check_duplicate_title_meta(url, details.get("meta_title", ""),
+                                                       details.get("meta_description", ""), all_pages_df))
+
+            render_action_list(build_action_list(checks, qa, title_suggs))
+            render_query_analysis(qa, title_suggs)
             render_checks(checks)
 
             link_urls = [l["href"] for l in details["links"]]
