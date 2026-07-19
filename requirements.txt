@@ -3,3 +3,5 @@ requests
 beautifulsoup4
 lxml
 python-docx
+scikit-learn
+numpy
